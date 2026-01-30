@@ -1,0 +1,8 @@
+python-dotenv==1.0.1
+yookassa==2.4.0
+requests==2.31.0
+fastapi==0.110.0
+uvicorn==0.27.1
+python-telegram-bot>=21.0,<22
+python-dotenv==1.0.1
+
