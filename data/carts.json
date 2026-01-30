@@ -3,11 +3,6 @@
     "user_id": 5240806878,
     "items": [
       {
-        "product_id": 9,
-        "qty": 1,
-        "price": 0.1
-      },
-      {
         "product_id": 1,
         "qty": 1,
         "price": 490

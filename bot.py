@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 import os
 import json
 import logging
+import sys
 from pathlib import Path
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
@@ -19,6 +20,18 @@ except Exception:
 BASE_DIR = Path(__file__).resolve().parent
 # Load .env relative to this file to avoid cwd-dependent failures on servers
 load_dotenv(dotenv_path=BASE_DIR / ".env")
+
+# python-telegram-bot 21.x is not compatible with Python 3.13 (Updater slots crash).
+# Prefer Python 3.12/3.11 (or pin in Docker). We warn instead of hard-failing to avoid surprise shutdowns.
+if sys.version_info >= (3, 13):
+    try:
+        print(
+            "\nВНИМАНИЕ: python-telegram-bot 21.x не поддерживает Python 3.13 — возможны падения.\n"
+            "Рекомендуется Python 3.12/3.11 или запуск через Docker с Python <= 3.12.\n",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
 
 # Basic logging for the application
 logging.basicConfig(
@@ -132,14 +145,16 @@ def ensure_data_files():
 
 
 def _read_wait_notify_map() -> dict:
-    data = read_json(WAIT_NOTIFY_FILE)
-    return data if isinstance(data, dict) else {}
+    with _interprocess_lock(_wait_notify_lock_path()):
+        data = read_json(WAIT_NOTIFY_FILE, default={})
+        return data if isinstance(data, dict) else {}
 
 
 def _write_wait_notify_map(data: dict) -> None:
     if not isinstance(data, dict):
         data = {}
-    write_json(WAIT_NOTIFY_FILE, data)
+    with _interprocess_lock(_wait_notify_lock_path()):
+        write_json(WAIT_NOTIFY_FILE, data)
 
 
 def subscribe_notify(user_id: int, product_id: int) -> bool:
@@ -206,7 +221,11 @@ async def notify_users_product_available(context: ContextTypes.DEFAULT_TYPE, pro
 
 def read_json(path: Path, default=None):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # Guard against accidentally persisted JSON null -> Python None.
+        if data is None:
+            return default if default is not None else []
+        return data
     except Exception:
         return default if default is not None else []
 
@@ -417,24 +436,26 @@ def _find_user_record(path: Path, user_id: int):
 
 
 def add_admin(admin_id: int):
-    data = read_json(ADMINS_FILE)
-    try:
-        ids = [int(x) for x in data]
-    except Exception:
-        ids = []
-    if admin_id not in ids:
-        ids.append(int(admin_id))
-    write_json(ADMINS_FILE, ids)
+    with _interprocess_lock(_admins_lock_path()):
+        data = read_json(ADMINS_FILE, default=[])
+        try:
+            ids = [int(x) for x in (data or [])]
+        except Exception:
+            ids = []
+        if int(admin_id) not in ids:
+            ids.append(int(admin_id))
+        write_json(ADMINS_FILE, ids)
 
 
 def remove_admin(admin_id: int):
-    data = read_json(ADMINS_FILE)
-    try:
-        ids = [int(x) for x in data]
-    except Exception:
-        ids = []
-    ids = [i for i in ids if i != int(admin_id)]
-    write_json(ADMINS_FILE, ids)
+    with _interprocess_lock(_admins_lock_path()):
+        data = read_json(ADMINS_FILE, default=[])
+        try:
+            ids = [int(x) for x in (data or [])]
+        except Exception:
+            ids = []
+        ids = [i for i in ids if i != int(admin_id)]
+        write_json(ADMINS_FILE, ids)
 
 
 def _cart_lock_path() -> Path:
@@ -443,6 +464,55 @@ def _cart_lock_path() -> Path:
 
 def _products_lock_path() -> Path:
     return DATA_DIR / ".lock_products"
+
+
+def _favs_lock_path() -> Path:
+    return DATA_DIR / ".lock_favs"
+
+
+def _admins_lock_path() -> Path:
+    return DATA_DIR / ".lock_admins"
+
+
+def _users_lock_path() -> Path:
+    return DATA_DIR / ".lock_users"
+
+
+def _orders_lock_path() -> Path:
+    return DATA_DIR / ".lock_orders"
+
+
+def _pending_lock_path() -> Path:
+    return DATA_DIR / ".lock_pending"
+
+
+def _orders_pending_lock_path() -> Path:
+    # Used for cross-file operations (e.g. unique number/id sequence across orders + pending)
+    return DATA_DIR / ".lock_orders_pending"
+
+
+def _addresses_lock_path() -> Path:
+    return DATA_DIR / ".lock_addresses"
+
+
+def _profiles_lock_path() -> Path:
+    return DATA_DIR / ".lock_profiles"
+
+
+def _broadcasts_lock_path() -> Path:
+    return DATA_DIR / ".lock_broadcasts"
+
+
+def _notifications_lock_path() -> Path:
+    return DATA_DIR / ".lock_notifications"
+
+
+def _cats_lock_path() -> Path:
+    return DATA_DIR / ".lock_categories"
+
+
+def _wait_notify_lock_path() -> Path:
+    return DATA_DIR / ".lock_wait_notify"
 
 
 def _interprocess_lock(lock_path: Path):
@@ -738,26 +808,32 @@ def _release_stock_for_pending(pending: dict) -> None:
 
 
 def add_to_fav(user_id: int, prod_id: int):
-    data = read_json(FAV_FILE)
-    rec = next((r for r in data if r.get("user_id") == user_id), None)
-    if not rec:
-        rec = {"user_id": user_id, "items": []}
-        data.append(rec)
-    if prod_id not in rec["items"]:
-        rec["items"].append(prod_id)
-    write_json(FAV_FILE, data)
+    with _interprocess_lock(_favs_lock_path()):
+        data = read_json(FAV_FILE, default=[])
+        data = data if isinstance(data, list) else []
+        rec = next((r for r in data if r.get("user_id") == user_id), None)
+        if not rec:
+            rec = {"user_id": user_id, "items": []}
+            data.append(rec)
+        if prod_id not in (rec.get("items") or []):
+            rec.setdefault("items", []).append(prod_id)
+        write_json(FAV_FILE, data)
 
 
 def get_favs(user_id: int):
-    data = read_json(FAV_FILE)
-    rec = next((r for r in data if r.get("user_id") == user_id), None)
-    return rec["items"] if rec else []
+    with _interprocess_lock(_favs_lock_path()):
+        data = read_json(FAV_FILE, default=[])
+        data = data if isinstance(data, list) else []
+        rec = next((r for r in data if r.get("user_id") == user_id), None)
+        return rec.get("items", []) if rec else []
 
 
 def clear_favs(user_id: int):
-    data = read_json(FAV_FILE)
-    data = [r for r in data if r.get("user_id") != user_id]
-    write_json(FAV_FILE, data)
+    with _interprocess_lock(_favs_lock_path()):
+        data = read_json(FAV_FILE, default=[])
+        data = data if isinstance(data, list) else []
+        data = [r for r in data if r.get("user_id") != user_id]
+        write_json(FAV_FILE, data)
 
 
 def is_admin(user_id: int) -> bool:
@@ -818,42 +894,43 @@ def create_order(
     `user` is a telegram-like User object, `items` is list of dicts with keys: product_id, name, qty, price.
     If `number` is provided, it will be preserved (useful to match the payment description/order number).
     """
-    orders = read_orders()
-    new_id = get_next_id(orders)
-    order_number = int(number) if number is not None else (1000 + len(orders) + 1)
-    total = sum((it.get("price", 0) * it.get("qty", 1)) for it in items)
-    from time import time
-    now = time()
-    created_ts = float(created_at) if created_at is not None else now
-    # attach stored client profile if present
-    profiles = read_profiles()
-    profile = profiles.get(str(user.id), {})
-    order = {
-        "id": new_id,
-        "number": order_number,
-        "user_id": int(user.id),
-        "username": user.username or "",
-        "full_name": f"{user.first_name or ''} {user.last_name or ''}".strip(),
-        "items": items,
-        "total": total,
-        "address": address_text,
-        "delivery": delivery_method,
-        "status": "new",
-        "tracking_link": None,
-        "created_at": created_ts,
-        "updated_at": now,
-        "client": {
-            "first_name": profile.get("first_name"),
-            "last_name": profile.get("last_name"),
-            "patronymic": profile.get("patronymic"),
-            "phone": profile.get("phone"),
-        },
-    }
-    if payment_id:
-        order["payment_id"] = str(payment_id)
-    orders.append(order)
-    write_orders(orders)
-    return order
+    with _interprocess_lock(_orders_lock_path()):
+        orders = read_orders() or []
+        new_id = get_next_id(orders)
+        order_number = int(number) if number is not None else (1000 + len(orders) + 1)
+        total = sum((it.get("price", 0) * it.get("qty", 1)) for it in items)
+        from time import time
+        now = time()
+        created_ts = float(created_at) if created_at is not None else now
+        # attach stored client profile if present
+        profiles = read_profiles()
+        profile = profiles.get(str(user.id), {})
+        order = {
+            "id": new_id,
+            "number": order_number,
+            "user_id": int(user.id),
+            "username": user.username or "",
+            "full_name": f"{user.first_name or ''} {user.last_name or ''}".strip(),
+            "items": items,
+            "total": total,
+            "address": address_text,
+            "delivery": delivery_method,
+            "status": "new",
+            "tracking_link": None,
+            "created_at": created_ts,
+            "updated_at": now,
+            "client": {
+                "first_name": profile.get("first_name"),
+                "last_name": profile.get("last_name"),
+                "patronymic": profile.get("patronymic"),
+                "phone": profile.get("phone"),
+            },
+        }
+        if payment_id:
+            order["payment_id"] = str(payment_id)
+        orders.append(order)
+        write_json(ORDERS_FILE, orders)
+        return order
 
 
 def find_order(order_id: int):
@@ -862,13 +939,14 @@ def find_order(order_id: int):
 
 
 def update_order(order):
-    orders = read_orders()
-    for i, o in enumerate(orders):
-        if o.get("id") == order.get("id"):
-            orders[i] = order
-            write_orders(orders)
-            return True
-    return False
+    with _interprocess_lock(_orders_lock_path()):
+        orders = read_orders() or []
+        for i, o in enumerate(orders):
+            if o.get("id") == order.get("id"):
+                orders[i] = order
+                write_json(ORDERS_FILE, orders)
+                return True
+        return False
 
 
 def _orders_by_created_date():
@@ -968,18 +1046,19 @@ def read_broadcasts():
 
 
 def write_broadcasts(data):
-    write_json(BROADS_FILE, data)
+    with _interprocess_lock(_broadcasts_lock_path()):
+        write_json(BROADS_FILE, data)
 
 
 def read_notifications():
-    try:
-        return json.loads(NOTIF_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    with _interprocess_lock(_notifications_lock_path()):
+        data = read_json(NOTIF_FILE, default={})
+        return data if isinstance(data, dict) else {}
 
 
 def write_notifications(cfg):
-    NOTIF_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    with _interprocess_lock(_notifications_lock_path()):
+        write_json(NOTIF_FILE, cfg if isinstance(cfg, dict) else {})
 
 
 def get_recipients_list():
@@ -1024,7 +1103,8 @@ def read_users():
 
 
 def write_users(data):
-    write_json(USERS_FILE, data)
+    with _interprocess_lock(_users_lock_path()):
+        write_json(USERS_FILE, data)
 
 
 def add_user_if_new(user_id: int):
@@ -1033,17 +1113,17 @@ def add_user_if_new(user_id: int):
     except Exception:
         pass
     try:
-        data = read_users()
-        # normalize to ints
-        ids = []
-        try:
-            ids = [int(x) for x in data]
-        except Exception:
-            ids = []
-        if int(user_id) not in ids:
-            ids.append(int(user_id))
-            write_users(ids)
-            return True
+        with _interprocess_lock(_users_lock_path()):
+            data = read_users()
+            # normalize to ints
+            try:
+                ids = [int(x) for x in (data or [])]
+            except Exception:
+                ids = []
+            if int(user_id) not in ids:
+                ids.append(int(user_id))
+                write_json(USERS_FILE, ids)
+                return True
     except Exception:
         pass
     return False
@@ -1078,7 +1158,8 @@ def read_addresses():
 
 
 def write_addresses(data):
-    ADDR_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    with _interprocess_lock(_addresses_lock_path()):
+        write_json(ADDR_FILE, data if isinstance(data, dict) else {})
 
 
 def read_profiles():
@@ -1086,7 +1167,8 @@ def read_profiles():
 
 
 def write_profiles(data):
-    PROFILE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    with _interprocess_lock(_profiles_lock_path()):
+        write_json(PROFILE_FILE, data if isinstance(data, dict) else {})
 
 
 def read_pending_orders():
@@ -1094,22 +1176,29 @@ def read_pending_orders():
 
 
 def write_pending_orders(data):
-    write_json(PENDING_FILE, data)
+    with _interprocess_lock(_pending_lock_path()):
+        write_json(PENDING_FILE, data)
 
 
-def next_order_number():
-    # number independent sequence including pending
-    orders = read_orders()
-    pend = read_pending_orders()
-    all_numbers = [o.get("number", 0) for o in orders + pend]
+def next_order_number(orders=None, pend=None):
+    """Next order number unique across orders + pending."""
+    if orders is None or pend is None:
+        with _interprocess_lock(_orders_pending_lock_path()):
+            orders = read_orders() or []
+            pend = read_pending_orders() or []
+    orders = orders or []
+    pend = pend or []
+    all_numbers = [o.get("number", 0) for o in (orders + pend)]
     return max(all_numbers, default=1000) + 1
 
 
 def create_pending_order(user, items, address_text: str, delivery_method: str | None, order_type: str | None = None):
     total = sum((it.get("price", 0) * it.get("qty", 1)) for it in items)
-    pend = read_pending_orders()
-    new_id = get_next_id(pend)
-    number = next_order_number()
+    with _interprocess_lock(_orders_pending_lock_path()):
+        orders = read_orders() or []
+        pend = read_pending_orders() or []
+        new_id = get_next_id(pend)
+        number = next_order_number(orders=orders, pend=pend)
     from time import time
     now = time()
     profiles = read_profiles()
@@ -1136,8 +1225,10 @@ def create_pending_order(user, items, address_text: str, delivery_method: str | 
         "type": order_type,
         "payment_id": None,
     }
-    pend.append(pending)
-    write_pending_orders(pend)
+    with _interprocess_lock(_pending_lock_path()):
+        pend_now = read_pending_orders() or []
+        pend_now.append(pending)
+        write_json(PENDING_FILE, pend_now)
     return pending
 
 
@@ -1176,7 +1267,13 @@ def create_yookassa_payment(order_like):
         return digits
 
     return_url = os.getenv("YOOKASSA_RETURN_URL") or f"https://t.me/{os.getenv('BOT_USERNAME','YOUR_BOT_USERNAME')}"
-    idempotence_key = str(uuid.uuid4())
+    # Deterministic idempotence key to prevent duplicate payments on retries.
+    try:
+        oid = int(order_like.get("id"))
+        idempotence_key = f"pay_{oid}"
+    except Exception:
+        idempotence_key = str(uuid.uuid4())
+    idempotence_key = str(idempotence_key)[:64]
 
     # Build receipt per YooKassa requirements
     try:
@@ -1415,7 +1512,10 @@ def admin_keyboard():
 
 def admin_menu_keyboard():
     # Removed settings button as requested
-    return ReplyKeyboardMarkup([["📂 Каталог", "📦 Заказы"], ["📊 Статистика", "📢 Рассылка"], ["🔙 Выйти из админки"]], resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        [["📂 Каталог", "📦 Заказы"], ["📊 Статистика", "📢 Рассылка"], ["🔙 Выйти из админки"]],
+        resize_keyboard=True,
+    )
 
 
 def user_main_keyboard():
@@ -1484,8 +1584,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await show_user_categories(update, context)
         try:
             await update.message.delete()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Cannot delete message: {e}")
         return
     if t == "🛒 Корзина":
         context.user_data.pop("state", None)
@@ -1493,8 +1593,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await show_user_cart(update, context)
         try:
             await update.message.delete()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Cannot delete message: {e}")
         return
     if t == "⭐ Избранное":
         context.user_data.pop("state", None)
@@ -1502,8 +1602,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await show_user_favorites(update, context)
         try:
             await update.message.delete()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Cannot delete message: {e}")
         return
     if t == "📦 Мои заказы":
         context.user_data.pop("state", None)
@@ -1511,8 +1611,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await show_user_orders(update, context)
         try:
             await update.message.delete()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Cannot delete message: {e}")
         return
     if t == "ℹ️ О магазине":
         text_info = (
@@ -1657,12 +1757,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         _, cat_id = state.split(":")
         cat_id = int(cat_id)
         new_name = text.strip()
-        cats = read_json(CATS_FILE)
-        for c in cats:
-            if c["id"] == cat_id:
-                c["name"] = new_name
-                break
-        write_json(CATS_FILE, cats)
+        with _interprocess_lock(_cats_lock_path()):
+            cats = read_json(CATS_FILE, default=[])
+            cats = cats if isinstance(cats, list) else []
+            for c in cats:
+                if c["id"] == cat_id:
+                    c["name"] = new_name
+                    break
+            write_json(CATS_FILE, cats)
         context.user_data.pop("state", None)
         await update.message.reply_text(f"✅ Каталог переименован")
         await show_category(update.message, context, cat_id)
@@ -1689,31 +1791,34 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Profile collection flow: first name, last name, patronymic, phone
     if state == "profile_first_name":
-        profiles = read_profiles()
-        uid = str(update.effective_user.id)
-        profiles.setdefault(uid, {})
-        profiles[uid]["first_name"] = update.message.text.strip()
-        write_profiles(profiles)
+        with _interprocess_lock(_profiles_lock_path()):
+            profiles = read_profiles()
+            uid = str(update.effective_user.id)
+            profiles.setdefault(uid, {})
+            profiles[uid]["first_name"] = update.message.text.strip()
+            write_json(PROFILE_FILE, profiles)
         context.user_data["state"] = "profile_last_name"
         await update.message.reply_text("👤 Введите *фамилию*:", parse_mode="Markdown")
         return
 
     if state == "profile_last_name":
-        profiles = read_profiles()
-        uid = str(update.effective_user.id)
-        profiles.setdefault(uid, {})
-        profiles[uid]["last_name"] = update.message.text.strip()
-        write_profiles(profiles)
+        with _interprocess_lock(_profiles_lock_path()):
+            profiles = read_profiles()
+            uid = str(update.effective_user.id)
+            profiles.setdefault(uid, {})
+            profiles[uid]["last_name"] = update.message.text.strip()
+            write_json(PROFILE_FILE, profiles)
         context.user_data["state"] = "profile_patronymic"
         await update.message.reply_text("👤 Введите *отчество*:", parse_mode="Markdown")
         return
 
     if state == "profile_patronymic":
-        profiles = read_profiles()
-        uid = str(update.effective_user.id)
-        profiles.setdefault(uid, {})
-        profiles[uid]["patronymic"] = update.message.text.strip()
-        write_profiles(profiles)
+        with _interprocess_lock(_profiles_lock_path()):
+            profiles = read_profiles()
+            uid = str(update.effective_user.id)
+            profiles.setdefault(uid, {})
+            profiles[uid]["patronymic"] = update.message.text.strip()
+            write_json(PROFILE_FILE, profiles)
         # If phone already exists (old users), do not force re-entering it.
         try:
             phone_existing = (profiles.get(uid, {}).get("phone") or "").strip()
@@ -1735,14 +1840,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if state == "profile_phone":
-        profiles = read_profiles()
-        uid = str(update.effective_user.id)
         # accept manual entry if present
         phone = update.message.text.strip() if update.message and update.message.text else None
         if phone:
-            profiles.setdefault(uid, {})
-            profiles[uid]["phone"] = phone
-            write_profiles(profiles)
+            with _interprocess_lock(_profiles_lock_path()):
+                profiles = read_profiles()
+                uid = str(update.effective_user.id)
+                profiles.setdefault(uid, {})
+                profiles[uid]["phone"] = phone
+                write_json(PROFILE_FILE, profiles)
             context.user_data.pop("state", None)
             await update.message.reply_text(
                 "✅ Данные сохранены\n\n🔒 Ваши данные используются только для оформления заказа",
@@ -1756,19 +1862,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if state and state.startswith("pvz_input:"):
         delivery = state.split(":", 1)[1]
         pvz = update.message.text.strip()
-        addrs = read_addresses()
-        uid = str(update.effective_user.id)
-        raw = addrs.get(uid)
-        # migrate old list format to dict-per-delivery on first PVZ input
-        if raw is None:
-            addrs[uid] = {}
-        elif isinstance(raw, list):
-            addrs[uid] = {}
-        # ensure nested structure per delivery
-        addrs[uid].setdefault(delivery, [])
-        if pvz and pvz not in addrs[uid][delivery]:
-            addrs[uid][delivery].append(pvz)
-        write_addresses(addrs)
+        with _interprocess_lock(_addresses_lock_path()):
+            addrs = read_addresses()
+            uid = str(update.effective_user.id)
+            raw = addrs.get(uid)
+            # migrate old list format to dict-per-delivery on first PVZ input
+            if raw is None:
+                addrs[uid] = {}
+            elif isinstance(raw, list):
+                addrs[uid] = {}
+            # ensure nested structure per delivery
+            addrs[uid].setdefault(delivery, [])
+            if pvz and pvz not in addrs[uid][delivery]:
+                addrs[uid][delivery].append(pvz)
+            write_json(ADDR_FILE, addrs)
         pending = context.user_data.get("pending_order", {})
         pending["address"] = pvz
         pending["delivery"] = delivery
@@ -1806,11 +1913,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception:
             pass
         prod["stock"] = stock
-        prods = read_json(PROD_FILE)
-        new_id = get_next_id(prods)
-        prod["id"] = new_id
-        prods.append(prod)
-        write_json(PROD_FILE, prods)
+        with _interprocess_lock(_products_lock_path()):
+            prods = read_json(PROD_FILE, default=[])
+            prods = prods if isinstance(prods, list) else []
+            new_id = get_next_id(prods)
+            prod["id"] = new_id
+            prods.append(prod)
+            write_json(PROD_FILE, prods)
         context.user_data.pop("new_product", None)
         context.user_data.pop("state", None)
         await update.message.reply_text("✅ Товар добавлен")
@@ -1832,17 +1941,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         _, prod_id = state.split(":")
         prod_id = int(prod_id)
         new_name = sanitize_product_name(text)
-        prods = read_json(PROD_FILE)
-        for p in prods:
-            if p["id"] == prod_id:
-                p["name"] = new_name
-                cat_id = p["category_id"]
-                break
-        write_json(PROD_FILE, prods)
+        prod = None
+        with _interprocess_lock(_products_lock_path()):
+            prods = read_json(PROD_FILE, default=[])
+            prods = prods if isinstance(prods, list) else []
+            for p in prods:
+                if p.get("id") == prod_id:
+                    p["name"] = new_name
+                    cat_id = p.get("category_id")
+                    prod = dict(p)
+                    break
+            write_json(PROD_FILE, prods)
         context.user_data.pop("state", None)
         await update.message.reply_text("✅ Название обновлено")
         # show updated product card
-        prod = next((p for p in prods if p["id"] == prod_id), None)
         if prod:
             await send_product_card(update.message.chat_id, context, prod)
         return
@@ -1851,16 +1963,19 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         _, prod_id = state.split(":")
         prod_id = int(prod_id)
         new_desc = text.strip()
-        prods = read_json(PROD_FILE)
-        for p in prods:
-            if p["id"] == prod_id:
-                p["description"] = new_desc
-                cat_id = p["category_id"]
-                break
-        write_json(PROD_FILE, prods)
+        prod = None
+        with _interprocess_lock(_products_lock_path()):
+            prods = read_json(PROD_FILE, default=[])
+            prods = prods if isinstance(prods, list) else []
+            for p in prods:
+                if p.get("id") == prod_id:
+                    p["description"] = new_desc
+                    cat_id = p.get("category_id")
+                    prod = dict(p)
+                    break
+            write_json(PROD_FILE, prods)
         context.user_data.pop("state", None)
         await update.message.reply_text("✅ Описание обновлено")
-        prod = next((p for p in prods if p["id"] == prod_id), None)
         if prod:
             await send_product_card(update.message.chat_id, context, prod)
         return
@@ -1874,16 +1989,19 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except ValueError:
             await update.message.reply_text("Неверный формат цены. Введите число.")
             return
-        prods = read_json(PROD_FILE)
-        for p in prods:
-            if p["id"] == prod_id:
-                p["price"] = price
-                cat_id = p["category_id"]
-                break
-        write_json(PROD_FILE, prods)
+        prod = None
+        with _interprocess_lock(_products_lock_path()):
+            prods = read_json(PROD_FILE, default=[])
+            prods = prods if isinstance(prods, list) else []
+            for p in prods:
+                if p.get("id") == prod_id:
+                    p["price"] = price
+                    cat_id = p.get("category_id")
+                    prod = dict(p)
+                    break
+            write_json(PROD_FILE, prods)
         context.user_data.pop("state", None)
         await update.message.reply_text("✅ Цена обновлена")
-        prod = next((p for p in prods if p["id"] == prod_id), None)
         if prod:
             await send_product_card(update.message.chat_id, context, prod)
         return
@@ -1916,27 +2034,31 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "❌ Введите число в формате: +10 (прибавить), -9 (убавить), 25 (установить остаток)."
             )
             return
-        prods = read_json(PROD_FILE)
+        prod = None
         name = None
         stock = None
-        for p in prods:
-            if p.get("id") == prod_id:
-                old_stock = int(p.get("stock", 0) or 0)
-                if mode == "delta":
-                    p["stock"] = max(0, old_stock + int(delta))
-                else:
-                    p["stock"] = int(new_abs)
-                name = p.get("name")
-                stock = p.get("stock")
-                break
-        write_json(PROD_FILE, prods)
+        old_stock = 0
+        with _interprocess_lock(_products_lock_path()):
+            prods = read_json(PROD_FILE, default=[])
+            prods = prods if isinstance(prods, list) else []
+            for p in prods:
+                if p.get("id") == prod_id:
+                    old_stock = int(p.get("stock", 0) or 0)
+                    if mode == "delta":
+                        p["stock"] = max(0, old_stock + int(delta))
+                    else:
+                        p["stock"] = int(new_abs)
+                    name = p.get("name")
+                    stock = p.get("stock")
+                    prod = dict(p)
+                    break
+            write_json(PROD_FILE, prods)
         context.user_data.pop("state", None)
         await update.message.reply_text(
             f"✅ Остаток обновлён: *{name}*\n📦 В наличии: {stock} шт",
             parse_mode="Markdown"
         )
         # show updated card if possible
-        prod = next((p for p in prods if p.get("id") == prod_id), None)
         if prod:
             await send_product_card(update.message.chat_id, context, prod)
 
@@ -2099,6 +2221,38 @@ def get_cat_name(cat_id: int) -> str:
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    try:
+        await _callback_handler_impl(update, context)
+    except Exception as e:
+        # Ensure Telegram UI isn't stuck on "loading"
+        try:
+            if query:
+                try:
+                    await query.answer()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # User-facing error message
+        try:
+            if query:
+                await safe_edit_message(query, "❌ Произошла ошибка. Попробуйте ещё раз через пару секунд.")
+            else:
+                uid = update.effective_user.id if update and update.effective_user else None
+                if uid is not None:
+                    await context.bot.send_message(chat_id=int(uid), text="❌ Произошла ошибка. Попробуйте ещё раз.")
+        except Exception:
+            pass
+
+        try:
+            logger.exception("Unhandled exception in callback_handler: %s", e)
+        except Exception:
+            pass
+
+
+async def _callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     try:
         print(f"CB from {query.from_user.id}: data={query.data}")
@@ -2718,37 +2872,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             user = query.from_user.id
             clear_cart(user)
             context.user_data.pop("qty_map", None)  # Clear quantity selections
-            await safe_edit_message(query, "🗑 Корзина очищена.")
             try:
-                chat_id = int(query.message.chat_id)
-                msg_id = int(query.message.message_id)
-
-                async def _rerender():
-                    await asyncio.sleep(2)
-                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="user_back_to_cats")]])
-                    await _screen_edit_by_ids(context, chat_id, msg_id, "🛒 Ваша корзина пуста.", reply_markup=kb)
-
-                context.application.create_task(_rerender())
+                await query.answer("Корзина очищена")
             except Exception:
                 pass
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="user_back_to_cats")]])
+            await safe_edit_message(query, "🛒 Ваша корзина пуста.", reply_markup=kb)
             return
 
         if data == "user_clear_favs":
             user = query.from_user.id
             clear_favs(user)
-            await safe_edit_message(query, "🗑 Избранное очищено.")
             try:
-                chat_id = int(query.message.chat_id)
-                msg_id = int(query.message.message_id)
-
-                async def _rerender():
-                    await asyncio.sleep(2)
-                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="user_back_to_cats")]])
-                    await _screen_edit_by_ids(context, chat_id, msg_id, "⭐ У вас нет избранных товаров.", reply_markup=kb)
-
-                context.application.create_task(_rerender())
+                await query.answer("Избранное очищено")
             except Exception:
                 pass
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="user_back_to_cats")]])
+            await safe_edit_message(query, "⭐ У вас нет избранных товаров.", reply_markup=kb)
             return
 
         # handled above or unknown user callback -> return to avoid falling into admin handlers
@@ -3523,9 +3663,10 @@ async def finalize_order(source, context: ContextTypes.DEFAULT_TYPE):
     if not ok:
         try:
             # remove pending
-            pend_all = read_pending_orders()
-            pend_all = [p for p in pend_all if int(p.get("id", 0)) != int(pending.get("id", 0))]
-            write_pending_orders(pend_all)
+            with _interprocess_lock(_pending_lock_path()):
+                pend_all = read_pending_orders() or []
+                pend_all = [p for p in pend_all if int(p.get("id", 0)) != int(pending.get("id", 0))]
+                write_json(PENDING_FILE, pend_all)
         except Exception:
             pass
         await context.bot.send_message(chat_id=user.id, text=f"❌ Не удалось оформить заказ: {err or 'нет в наличии'}")
@@ -3533,17 +3674,18 @@ async def finalize_order(source, context: ContextTypes.DEFAULT_TYPE):
 
     # Persist reservation flags and any item filtering/total recompute done during reservation.
     try:
-        pend_all = read_pending_orders()
-        for po in pend_all:
-            if int(po.get("id", 0)) == int(pending.get("id", 0)):
-                po["reserved"] = True
-                po["reserved_at"] = pending.get("reserved_at")
-                if pending.get("items") is not None:
-                    po["items"] = pending.get("items")
-                if pending.get("total") is not None:
-                    po["total"] = pending.get("total")
-                break
-        write_pending_orders(pend_all)
+        with _interprocess_lock(_pending_lock_path()):
+            pend_all = read_pending_orders() or []
+            for po in pend_all:
+                if int(po.get("id", 0)) == int(pending.get("id", 0)):
+                    po["reserved"] = True
+                    po["reserved_at"] = pending.get("reserved_at")
+                    if pending.get("items") is not None:
+                        po["items"] = pending.get("items")
+                    if pending.get("total") is not None:
+                        po["total"] = pending.get("total")
+                    break
+            write_json(PENDING_FILE, pend_all)
     except Exception:
         pass
     try:
@@ -3555,19 +3697,24 @@ async def finalize_order(source, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         try:
-            pend_all = read_pending_orders()
-            pend_all = [p for p in pend_all if int(p.get("id", 0)) != int(pending.get("id", 0))]
-            write_pending_orders(pend_all)
+            with _interprocess_lock(_pending_lock_path()):
+                pend_all = read_pending_orders() or []
+                pend_all = [p for p in pend_all if int(p.get("id", 0)) != int(pending.get("id", 0))]
+                write_json(PENDING_FILE, pend_all)
         except Exception:
             pass
         await context.bot.send_message(chat_id=user.id, text=f"❌ Ошибка создания оплаты: {e}")
         return
-    pend_all = read_pending_orders()
-    for po in pend_all:
-        if po.get("id") == pending.get("id"):
-            po["payment_id"] = payment_id
-            break
-    write_pending_orders(pend_all)
+    try:
+        with _interprocess_lock(_pending_lock_path()):
+            pend_all = read_pending_orders() or []
+            for po in pend_all:
+                if int(po.get("id", 0)) == int(pending.get("id", 0)):
+                    po["payment_id"] = str(payment_id)
+                    break
+            write_json(PENDING_FILE, pend_all)
+    except Exception:
+        pass
     try:
         await context.bot.send_message(
             chat_id=user.id,
@@ -3662,18 +3809,23 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await update.message.reply_text("✅ Фото получено")
 
         # update product immediately with collected photos
-        prods = read_json(PROD_FILE)
+        prod = None
         updated = False
-        for p in prods:
-            if p.get("id") == prod_id:
-                p["photos"] = photos.copy()
-                updated = True
-                cat_id = p.get("category_id")
-                break
+        with _interprocess_lock(_products_lock_path()):
+            prods = read_json(PROD_FILE, default=[])
+            prods = prods if isinstance(prods, list) else []
+            for p in prods:
+                if p.get("id") == prod_id:
+                    p["photos"] = photos.copy()
+                    updated = True
+                    cat_id = p.get("category_id")
+                    prod = dict(p)
+                    break
+            if updated:
+                write_json(PROD_FILE, prods)
+
         if updated:
-            write_json(PROD_FILE, prods)
             await update.message.reply_text("✅ Фото товара обновлены")
-            prod = next((p for p in prods if p.get("id") == prod_id), None)
             if prod:
                 await send_product_card(update.message.chat_id, context, prod)
         context.user_data.pop("state", None)
@@ -3705,14 +3857,15 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     state = context.user_data.get("state")
     if state != "profile_phone":
         return
-    profiles = read_profiles()
-    uid = str(update.effective_user.id)
     phone = update.message.contact.phone_number if update.message and update.message.contact else None
     if not phone:
         return
-    profiles.setdefault(uid, {})
-    profiles[uid]["phone"] = phone
-    write_profiles(profiles)
+    with _interprocess_lock(_profiles_lock_path()):
+        profiles = read_profiles()
+        uid = str(update.effective_user.id)
+        profiles.setdefault(uid, {})
+        profiles[uid]["phone"] = phone
+        write_json(PROFILE_FILE, profiles)
     context.user_data.pop("state", None)
     await update.message.reply_text(
         "✅ Данные сохранены\n\n🔒 Ваши данные используются только для оформления заказа",
@@ -3806,8 +3959,9 @@ async def poll_payment_and_finalize(
             status = getattr(payment, "status", None)
             if status == "succeeded":
                 # Read pending order by ID
-                pend_all = read_pending_orders()
-                pending = next((p for p in pend_all if int(p.get("id", 0)) == int(pending_id)), None)
+                with _interprocess_lock(_pending_lock_path()):
+                    pend_all = read_pending_orders() or []
+                    pending = next((p for p in pend_all if int(p.get("id", 0)) == int(pending_id)), None)
                 if not pending:
                     # Already processed (maybe via webhook)
                     try:
@@ -3815,6 +3969,31 @@ async def poll_payment_and_finalize(
                     except Exception:
                         pass
                     return
+
+                # Idempotency: if an order with this payment_id already exists, just remove pending and exit.
+                try:
+                    pid_check = str(pending.get("payment_id") or payment_id or "").strip()
+                except Exception:
+                    pid_check = ""
+                if pid_check:
+                    try:
+                        with _interprocess_lock(_orders_lock_path()):
+                            existing_orders = read_orders() or []
+                            if any(str(o.get("payment_id")) == pid_check for o in existing_orders):
+                                try:
+                                    with _interprocess_lock(_pending_lock_path()):
+                                        pend_all2 = read_pending_orders() or []
+                                        pend_all2 = [p for p in pend_all2 if int(p.get("id", 0)) != int(pending_id)]
+                                        write_json(PENDING_FILE, pend_all2)
+                                except Exception:
+                                    pass
+                                try:
+                                    await context.bot.send_message(chat_id=user_id, text="✅ Оплата прошла, заказ подтверждён")
+                                except Exception:
+                                    pass
+                                return
+                    except Exception:
+                        pass
 
                 # Build user object
                 class U:
@@ -3842,43 +4021,47 @@ async def poll_payment_and_finalize(
 
                 # Decrease stock and alert admins if low/out-of-stock (skip if already reserved)
                 try:
-                    if pending.get("reserved"):
-                        # stock was already decreased at payment creation
-                        prods_all = read_json(PROD_FILE)
-                        prods_by_id = {int(p.get("id")): p for p in prods_all if p.get("id") is not None}
-                        events = []
-                        seen = set()
-                        for it in order.get("items", []):
-                            try:
-                                pid = int(it.get("product_id", 0))
-                            except Exception:
-                                continue
-                            if pid in seen:
-                                continue
-                            seen.add(pid)
-                            p = prods_by_id.get(pid)
-                            if not p:
-                                continue
-                            new_stock = int(p.get("stock", 0) or 0)
-                            if new_stock == 0:
-                                events.append(("out", p.copy()))
-                            elif new_stock <= 3:
-                                events.append(("low", p.copy()))
-                    else:
-                        prods_all = read_json(PROD_FILE)
-                        events = []
-                        for it in order.get("items", []):
-                            for p in prods_all:
-                                if int(p.get("id", 0)) == int(it.get("product_id", 0)):
-                                    old_stock = int(p.get("stock", 0) or 0)
-                                    p["stock"] = max(0, old_stock - int(it.get("qty", 1)))
-                                    new_stock = int(p.get("stock", 0) or 0)
-                                    if new_stock == 0:
-                                        events.append(("out", p.copy()))
-                                    elif new_stock <= 3 and old_stock > 3:
-                                        events.append(("low", p.copy()))
-                                    break
-                        write_json(PROD_FILE, prods_all)
+                try:
+                    with _interprocess_lock(_products_lock_path()):
+                        if pending.get("reserved"):
+                            # stock was already decreased at payment creation
+                            prods_all = read_json(PROD_FILE, default=[])
+                            prods_all = prods_all if isinstance(prods_all, list) else []
+                            prods_by_id = {int(p.get("id")): p for p in prods_all if p.get("id") is not None}
+                            events = []
+                            seen = set()
+                            for it in order.get("items", []):
+                                try:
+                                    pid = int(it.get("product_id", 0))
+                                except Exception:
+                                    continue
+                                if pid in seen:
+                                    continue
+                                seen.add(pid)
+                                p = prods_by_id.get(pid)
+                                if not p:
+                                    continue
+                                new_stock = int(p.get("stock", 0) or 0)
+                                if new_stock == 0:
+                                    events.append(("out", p.copy()))
+                                elif new_stock <= 3:
+                                    events.append(("low", p.copy()))
+                        else:
+                            prods_all = read_json(PROD_FILE, default=[])
+                            prods_all = prods_all if isinstance(prods_all, list) else []
+                            events = []
+                            for it in order.get("items", []):
+                                for p in prods_all:
+                                    if int(p.get("id", 0)) == int(it.get("product_id", 0)):
+                                        old_stock = int(p.get("stock", 0) or 0)
+                                        p["stock"] = max(0, old_stock - int(it.get("qty", 1)))
+                                        new_stock = int(p.get("stock", 0) or 0)
+                                        if new_stock == 0:
+                                            events.append(("out", p.copy()))
+                                        elif new_stock <= 3 and old_stock > 3:
+                                            events.append(("low", p.copy()))
+                                        break
+                            write_json(PROD_FILE, prods_all)
 
                     admins = read_json(ADMINS_FILE)
                     for kind, prod_event in events:
@@ -3910,8 +4093,14 @@ async def poll_payment_and_finalize(
                     pass
 
                 # Remove from pending
-                pend_all = [p for p in pend_all if int(p.get("id", 0)) != int(pending_id)]
-                write_pending_orders(pend_all)
+                # Remove from pending
+                try:
+                    with _interprocess_lock(_pending_lock_path()):
+                        pend_all = read_pending_orders() or []
+                        pend_all = [p for p in pend_all if int(p.get("id", 0)) != int(pending_id)]
+                        write_json(PENDING_FILE, pend_all)
+                except Exception:
+                    pass
 
                 # Notify user
                 try:
@@ -4293,31 +4482,52 @@ async def show_user_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         keyboard = []
         lines = []
         total = 0.0
+        removed_pids: set[int] = set()
         for ci in cart_items:
             try:
                 pid = int(ci.get("product_id"))
             except Exception:
                 continue
             p = prods_by_id.get(pid)
-            if p:
-                price_raw = ci.get("price")
-                if price_raw is None:
-                    price_raw = p.get("price", 0)
+            if not p:
+                removed_pids.add(pid)
+                continue
+            price_raw = ci.get("price")
+            if price_raw is None:
+                price_raw = p.get("price", 0)
+            try:
+                price = float(price_raw)
+            except (TypeError, ValueError):
+                price = 0.0
+            try:
+                qty = int(ci.get("qty", 1) or 1)
+            except Exception:
+                qty = 1
+            if qty < 1:
+                qty = 1
+            total += price * qty
+            name = (p.get('name') or '-').strip()
+            # show stored price per unit
+            lines.append(f"• {name} — {price_raw} ₽ × {qty}")
+            keyboard.append([InlineKeyboardButton(f"🛒 {name}", callback_data=f"user_prod:{p.get('id')}")])
+
+        if removed_pids:
+            for pid in removed_pids:
                 try:
-                    price = float(price_raw)
-                except (TypeError, ValueError):
-                    price = 0.0
-                try:
-                    qty = int(ci.get("qty", 1) or 1)
+                    remove_from_cart(user, pid)
                 except Exception:
-                    qty = 1
-                if qty < 1:
-                    qty = 1
-                total += price * qty
-                name = (p.get('name') or '-').strip()
-                # show stored price per unit
-                lines.append(f"• {name} — {price_raw} ₽ × {qty}")
-                keyboard.append([InlineKeyboardButton(f"🛒 {name}", callback_data=f"user_prod:{p.get('id')}")])
+                    pass
+
+        if not lines:
+            msg = "🛒 Ваша корзина пуста."
+            if removed_pids:
+                msg = "🛒 В корзине были удалённые товары — я убрал их. Корзина пуста."
+            try:
+                await _cleanup_last_media(context, update.message.chat_id)
+            except Exception:
+                pass
+            await _screen_render_message(update, context, msg)
+            return
         total_str = str(int(round(total))) if abs(total - round(total)) < 1e-9 else (f"{total:.2f}".rstrip("0").rstrip("."))
         # buy all / clear / back
         keyboard.append([InlineKeyboardButton("💳 Заказать всё", callback_data="user_buy_cart")])
@@ -4430,8 +4640,10 @@ async def _finalize_paid_pending(context: ContextTypes.DEFAULT_TYPE, pending: di
                     )
                 except Exception:
                     pass
-                pend_all = [p for p in read_pending_orders() if str(p.get("payment_id")) != str(payment_id)]
-                write_pending_orders(pend_all)
+                with _interprocess_lock(_pending_lock_path()):
+                    pend_all = read_pending_orders() or []
+                    pend_all = [p for p in pend_all if str(p.get("payment_id")) != str(payment_id)]
+                    write_json(PENDING_FILE, pend_all)
                 return True
 
     # Build a minimal telegram-like user object
@@ -4514,9 +4726,10 @@ async def _finalize_paid_pending(context: ContextTypes.DEFAULT_TYPE, pending: di
 
     # Remove pending
     try:
-        pend_all = read_pending_orders()
-        pend_all = [p for p in pend_all if int(p.get("id", 0)) != int(pending.get("id", 0))]
-        write_pending_orders(pend_all)
+        with _interprocess_lock(_pending_lock_path()):
+            pend_all = read_pending_orders() or []
+            pend_all = [p for p in pend_all if int(p.get("id", 0)) != int(pending.get("id", 0))]
+            write_json(PENDING_FILE, pend_all)
     except Exception:
         pass
 
@@ -4591,9 +4804,10 @@ async def reconcile_pending_payments_once(app) -> None:
                 except Exception:
                     pass
                 try:
-                    pend_now = read_pending_orders()
-                    pend_now = [p for p in pend_now if str(p.get("payment_id")) != str(pid)]
-                    write_pending_orders(pend_now)
+                    with _interprocess_lock(_pending_lock_path()):
+                        pend_now = read_pending_orders() or []
+                        pend_now = [p for p in pend_now if str(p.get("payment_id")) != str(pid)]
+                        write_json(PENDING_FILE, pend_now)
                 except Exception:
                     pass
     except Exception:
@@ -4622,17 +4836,24 @@ def main() -> None:
         except Exception:
             pass
 
-        # Run one-shot reconciliation on startup, then keep reconciling in background.
-        try:
-            await reconcile_pending_payments_once(application)
-        except Exception:
-            pass
-        try:
-            application.bot_data["reconcile_task"] = asyncio.create_task(
-                reconcile_pending_payments_loop(application)
-            )
-        except Exception:
-            pass
+        # Optional reconciliation (webhook should be the primary source of truth).
+        def _truthy_env(name: str, default: str = "0") -> bool:
+            v = (os.getenv(name, default) or "").strip().lower()
+            return v in ("1", "true", "yes", "y", "on")
+
+        if _truthy_env("YOOKASSA_RECONCILE_ON_STARTUP", "1"):
+            try:
+                await reconcile_pending_payments_once(application)
+            except Exception:
+                pass
+
+        if _truthy_env("YOOKASSA_ENABLE_RECONCILE_LOOP", "0"):
+            try:
+                application.bot_data["reconcile_task"] = asyncio.create_task(
+                    reconcile_pending_payments_loop(application)
+                )
+            except Exception:
+                pass
 
     async def _post_shutdown(application):
         try:
